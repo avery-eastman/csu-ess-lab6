@@ -1,0 +1,12 @@
+---
+title: "Lab 6: Machine Learning in Hydrology"
+author: "Avery Eastman"
+format:
+   html:
+    code-fold: true
+    toc: true
+subtitle: 'Using Tidymodels & CAMELS Data'
+execute:
+  echo: true
+---
+

@@ -10,3 +10,302 @@ execute:
   echo: true
 ---
 
+## Load necessary libraries
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+```
+
+## Download data and documentation PDF
+
+```{r}
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+```
+
+## Getting basin characteristics
+
+```{r}
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+
+remote_files  <- glue('{root}/camels_{types}.txt')
+local_files   <- glue('data/camels_{types}.txt')
+
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+camels <- map(local_files, read_delim, show_col_types = FALSE)
+
+camels <- power_full_join(camels ,by = 'gauge_id')
+```
+
+## Question 1
+
+#### Make sure all data and the PDF are downloaded into you data directory
+
+#### From the documentation PDF, report what zero_q_freq represents
+
+Based on the PDF, zero_q_freq represents the frequency of days with zero streamflow, which is recorded as a percentage.
+
+## Question 2
+
+#### Make 2 maps of the sites, coloring the points by the aridty and p_mean column. Add clear labels, titles, and a color scale that makes sense for each parameter. Ensure these render as a single image with your choice of facet\_\*, patchwork, or ggpubr.
+
+```{r}
+library(ggplot2)
+library(ggthemes)
+library(ggpubr)
+
+map_aridity <- ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = aridity)) +
+  scale_color_gradient(low = "lightyellow", high = "darkred") +
+  ggtitle("Aridity at Each Site") +
+  theme_map() +
+  labs(color = "Aridity")
+
+map_p_mean <- ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = p_mean)) +
+  scale_color_gradient(low = "lightblue", high = "darkblue") +
+  ggtitle("Precipitation (p_mean) at Each Site") +
+  theme_map() +
+  labs(color = "p_mean")
+
+aridity_and_percipitation <- ggarrange(map_aridity, map_p_mean, ncol = 2, nrow = 1)
+
+aridity_and_percipitation
+
+ggsave("images/aridity_and_percipitation.png", width = 10, height = 5, dpi = 300)
+```
+
+## Model Building
+
+#### Splitting the data
+
+```{r}
+set.seed(123)
+# Bad form to perform simple transformations on the outcome variable within a recipe. So, we'll do it here.
+camels <- camels |> 
+  mutate(logQmean = log(q_mean))
+
+# Generate the split
+camels_split <- initial_split(camels, prop = 0.8)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+
+camels_cv <- vfold_cv(camels_train, v = 10)
+```
+
+#### Preprocessor: recipe
+
+```{r}
+# Create a recipe to preprocess the data
+rec <-  recipe(logQmean ~ aridity + p_mean, data = camels_train) |>
+  # Log transform the predictor variables (aridity and p_mean)
+  step_log(all_predictors()) |>
+  # Add an interaction term between aridity and p_mean
+  step_interact(terms = ~ aridity:p_mean) |> 
+  # Drop any rows with missing values in the pred
+  step_naomit(all_predictors(), all_outcomes())
+```
+
+## Linear regression and random forest models
+
+```{r}
+lm_model <- linear_reg() |>
+  # define the engine
+  set_engine("lm") |>
+  # define the mode
+  set_mode("regression")
+
+rf_model <- rand_forest() |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+```
+
+## Workflow_set approach
+
+```{r}
+wf <- workflow_set(list(rec), list(lm_model, rf_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv) 
+
+autoplot(wf)
+
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+```
+
+## Question 3
+
+#### Build a xgboost (engine) regression (mode) model using boost_tree
+
+```{r}
+bt_model <- boost_tree() |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+```
+
+#### Build a neural network model using the nnet engine from the baguette package using the bag_mlp function
+
+```{r}
+bag_model <- bag_mlp() |>
+  set_engine("nnet") |>
+  set_mode("regression")
+```
+
+#### Add this to the above workflow
+
+```{r}
+wf <- workflow_set(list(rec), list(lm_model, rf_model, bt_model, bag_model)) |>
+  workflow_map('fit_resamples', resamples = camels_cv) 
+```
+
+#### Evaluate the model and compare it to the linear and random forest models
+
+```{r}
+autoplot(wf)
+
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+```
+
+#### Which of the 4 models would you move forward with?
+I can see that the bag_mlp model outranks the other functions, so I would move forward with it. 
+
+## Question 4
+#### Borrowing from the workflow presented above, build your own complete ML pipeline to predict mean streamflow using the CAMELS dataset. You can experiment with different predictors and preprocessing steps to see how they impact model performance. A successful model will have a R-squared value > 0.9. 
+
+## 4a: Data Spliting
+
+```{r}
+# Set a seed for reproducible
+set.seed(123)
+
+camels <- camels |> 
+  mutate(logQmean = log(q_mean))
+
+# Create an initial split with 75% used for training and 25% for testing
+split_data <- initial_split(camels, prop = 0.75)
+
+# Extract your training and testing sets
+train_data <- training(split_data)
+test_data <- testing(split_data)
+
+# Build a 10-fold CV dataset
+cv_splits <- vfold_cv(train_data, v = 10)
+```
+
+## 4b: Recipe
+
+```{r}
+camels |> 
+  select(q_mean, low_prec_freq, gvf_max) |> 
+  drop_na() |>
+  cor()
+```
+
+
+```{r}
+ggplot(camels, aes(x = low_prec_freq, y = gvf_max)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm") +
+  # Apply a log transformation to the color scale
+  scale_color_viridis_c(trans = "log") +
+  scale_x_log10() + 
+  scale_y_log10() +
+  theme_linedraw() +
+  theme(legend.position = "bottom",
+        # Expand the legend width ...
+        legend.key.width = unit(2.5, "cm"),
+        legend.key.height = unit(.5, "cm")) +
+  labs(title = "Dry Period Duration vs Green Vegetation Fraction vs Runnoff", 
+       x = "Dry Period Duration", 
+       y = "Green Vegetation Fraction",
+       color = "Mean Flow")
+```
+
+#### Define a formula you want to use to predict logQmean 
+```{r}
+formula <- logQmean ~ low_prec_freq + gvf_max
+```
+
+#### Describe in words why you are choosing the formula you are
+I have chosen to use low_prec_freq and gvf_max as predictors for q_mean because they have shown to both have a strong correlation to mean flow, and there is an inverse correlation between dry period duration and green vegetation fraction. 
+
+#### Build a recipe that you feel handles the predictors chosen well
+```{r}
+recipe <- recipe(formula, data = train_data) |>
+  step_log(all_predictors()) |>
+  step_interact(terms = ~ low_prec_freq:gvf_max) |> 
+  step_naomit(all_predictors(), all_outcomes())
+```
+
+## 4c: Define 3 models
+#### Define a random forest model using the rand_forest function. Set the engine to ranger and the mode to regression. Define two other models of your choice
+```{r}
+new_rf_model <- rand_forest() |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+
+new_bt_model <- boost_tree() |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+new_bag_model <- bag_mlp() |>
+  set_engine("nnet") |>
+  set_mode("regression")
+```
+
+## 4d: Workflow set ()
+#### With your preprocessing steps and models defined, you can now build a workflow_set object to fit and evaluate your models. This will allow you to compare the performance of different models on the same data
+
+```{r}
+workflow_set <- workflow_set(list(recipe), list(new_rf_model, new_bt_model, new_bag_model)) |>
+  workflow_map('fit_resamples', resamples = cv_splits)
+```
+
+## 4e: Evaluation
+#### Use autoplot and rank_results to compare the models
+```{r}
+autoplot(workflow_set)
+
+rank_results(workflow_set, rank_metric = "rsq", select_best = TRUE)
+```
+
+#### Describe what model you think is best and why
+It looks like the random forest model is the best because it has the highest R-squared value (closest to a value of 1). 
+
+## 4f: Extact and Evaluate
+# Now that you found your favorite model, lets see how it does on the test data
+
+```{r}
+# Build a workflow (not workflow set) with your favorite model, recipe, and training data
+# Use fit to fit all training data to the model
+# Use augment to make predictions on the test data
+final_workflow <- workflow() |>
+  add_recipe(recipe) |>
+  add_model(new_rf_model) |>
+  fit(data = train_data) |>
+  augment(new_data = test_data)
+
+metrics(final_workflow, truth = logQmean, estimate = .pred)
+
+# Create a plot of the observed vs predicted values with clear title, axis labels, and a compelling color scale
+ggplot(final_workflow, aes(x = logQmean, y = .pred, colour = low_prec_freq)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw() +
+  labs(title = "Observed vs Predicted Streamflow Mean",
+       x = "Observed",
+       y = "Predicted")
+```
+
+#### Describe what you think of the results
+My model has a R-squared value of ~ 0.6446, meaning my model explains about 64.5% of the variation in streamflow based on average duration of dry periods and green vegetation fraction. I would say it is a decent model, given that streamflow has many other factors that influence it but I only used 2 predictors and still got an R-squared above 0.6. However, my model still doesn't explain around 35.5% of variability in streamflow. Overall, I would say my model is moderately successful.
+
